@@ -20,7 +20,7 @@ if __name__ == "__main__":
     
     # Lancer le serveur avec uvicorn
     uvicorn.run(
-        mcp.get_asgi_app(),
+        mcp.http_app(),
         host=host,
         port=port,
         log_level="info"
