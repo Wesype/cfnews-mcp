@@ -13,7 +13,7 @@ from utils.cfnews_client import CFNewsClient, CFNewsAPIError
 load_dotenv()
 
 # Créer le serveur MCP
-mcp = FastMCP("CFNEWS", dependencies=["httpx", "python-dotenv"])
+mcp = FastMCP("CFNEWS")
 
 # Client API global
 client: Optional[CFNewsClient] = None
