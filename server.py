@@ -1,7 +1,7 @@
 """Serveur MCP pour l'API CFNEWS — v2.0"""
+
 import os
 from typing import Optional, Dict, Any, List
-from datetime import datetime
 import json
 
 from fastmcp import FastMCP
@@ -9,13 +9,10 @@ from dotenv import load_dotenv
 
 from utils.cfnews_client import CFNewsClient, CFNewsAPIError
 
-# Charger les variables d'environnement
 load_dotenv()
 
-# Créer le serveur MCP
 mcp = FastMCP("CFNEWS")
 
-# Client API global
 client: Optional[CFNewsClient] = None
 
 
@@ -39,7 +36,6 @@ OPERATION_TYPE_MAPPING = {
     "BIMBO": 15812,
     "Public to Private": 25007,
     "Retournement": 14448,
-    "Venture Capital": 274,
 }
 
 SECTOR_MAPPING = {
@@ -133,6 +129,13 @@ PEOPLE_ORG_TYPE_MAPPING = {
     "Sociétés": 231,
 }
 
+COMPANY_TYPE_MAPPING = {
+    "Familiale": 260,
+    "Sté sous LBO": 20104,
+    "Cotée": 18904,
+    "Indépendante": 259,
+}
+
 SORT_ATTRIBUTE_MAPPING = {
     "date": "fiche_operation_operation_date_value_dt",
     "amount": "fiche_operation_montant_value_dt",
@@ -144,39 +147,39 @@ SORT_ATTRIBUTE_MAPPING = {
 # UTILITAIRES
 # ═══════════════════════════════════════════════════════════════
 
+
 def get_client() -> CFNewsClient:
     """Récupère ou initialise le client API."""
     global client
     if client is None:
         api_key = os.getenv("CFNEWS_API_KEY")
         if not api_key:
-            raise ValueError("CFNEWS_API_KEY non définie dans les variables d'environnement")
+            raise ValueError(
+                "CFNEWS_API_KEY non définie dans les variables d'environnement"
+            )
         client = CFNewsClient(api_key)
     return client
 
 
-def resolve_mapping(values: List[str], mapping: Dict[str, int]) -> List:
+def resolve_mapping(values: List[str], mapping: Dict[str, int]) -> tuple:
     """
     Résout une liste de valeurs textuelles vers leurs IDs via un mapping.
-    Si une valeur n'est pas trouvée, tente un match case-insensitive.
-    Retourne les IDs trouvés + un warning pour les valeurs non résolues.
+    Match case-insensitive. Retourne (resolved_ids, warnings).
     """
     resolved = []
     warnings = []
-    
-    # Index case-insensitive
     lower_mapping = {k.lower(): v for k, v in mapping.items()}
-    
+
     for val in values:
         if val in mapping:
             resolved.append(mapping[val])
         elif val.lower() in lower_mapping:
             resolved.append(lower_mapping[val.lower()])
         elif isinstance(val, int) or (isinstance(val, str) and val.isdigit()):
-            resolved.append(int(val))  # Déjà un ID numérique
+            resolved.append(int(val))
         else:
             warnings.append(val)
-    
+
     return resolved, warnings
 
 
@@ -184,7 +187,7 @@ def format_response(data: Dict[str, Any], max_items: int = 10) -> str:
     """Formate la réponse de l'API pour le LLM."""
     if "items" not in data:
         return json.dumps(data, ensure_ascii=False, indent=2)
-    
+
     result = {
         "count": data.get("count", 0),
         "total": data.get("total", 0),
@@ -192,28 +195,42 @@ def format_response(data: Dict[str, Any], max_items: int = 10) -> str:
         "nb_pages": data.get("nb_pages", 1),
         "items": data["items"][:max_items],
     }
-    
+
     total = data.get("total", 0)
     if total > max_items:
         result["note"] = (
             f"Affichage des {min(max_items, len(data['items']))} premiers résultats "
             f"sur {total} au total. Utilisez page=2, page=3... pour paginer."
         )
-    
+
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
-def apply_sort(filters: Dict, sort_by: Optional[str], sort_order: Optional[str]) -> None:
+def apply_sort(filters: Dict, sort_by: Optional[str], sort_order: Optional[str]):
     """Applique les paramètres de tri aux filtres."""
     if sort_by:
-        attr = SORT_ATTRIBUTE_MAPPING.get(sort_by, sort_by)
-        filters["sort_attribute"] = attr
+        filters["sort_attribute"] = SORT_ATTRIBUTE_MAPPING.get(sort_by, sort_by)
         filters["sort_type"] = sort_order or "descending"
+
+
+def _add_warnings(response: str, warnings: List[str]) -> str:
+    """Ajoute des warnings à une réponse JSON si nécessaire."""
+    if not warnings:
+        return response
+    parsed = json.loads(response)
+    parsed["warnings"] = warnings
+    return json.dumps(parsed, ensure_ascii=False, indent=2)
+
+
+def _error(e: Exception) -> str:
+    """Formate une erreur en JSON."""
+    return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════
 # TOOLS — RECHERCHE
 # ═══════════════════════════════════════════════════════════════
+
 
 @mcp.tool()
 async def search_operations(
@@ -263,26 +280,23 @@ async def search_operations(
             "Services", "Services Financiers", "Transport et Logistique"
         date_from: Date de début (format DD/MM/YYYY)
         date_to: Date de fin (format DD/MM/YYYY)
-        amount_min: Montant minimum de l'opération en M€
-        amount_max: Montant maximum de l'opération en M€
+        amount_min: Montant minimum en M€
+        amount_max: Montant maximum en M€
         sort_by: Champ de tri — "date" (défaut), "amount", "name"
-        sort_order: Ordre de tri — "descending" (défaut, plus récent d'abord) ou "ascending"
+        sort_order: Ordre — "descending" (défaut) ou "ascending"
         page: Numéro de page (commence à 1)
-        max_results: Nombre maximum de résultats à afficher (défaut 10)
+        max_results: Nombre de résultats à afficher (défaut 10)
 
     Returns:
         JSON formaté des opérations trouvées avec pagination
     """
     try:
         api_client = get_client()
-        filters = {}
-        warnings = []
+        filters: Dict[str, Any] = {}
+        warnings: List[str] = []
 
-        # Société cible
         if company_name:
             filters["op_nom"] = company_name
-
-        # Investisseur / acquéreur / cédant
         if investor_name:
             filters["op_invest"] = investor_name
         if investor_is_buyer:
@@ -290,53 +304,34 @@ async def search_operations(
         if investor_is_seller:
             filters["op_solder"] = "oui"
 
-        # Types d'opérations
         if operation_types:
             resolved, warns = resolve_mapping(operation_types, OPERATION_TYPE_MAPPING)
             if resolved:
                 filters["op_type"] = resolved
-            if warns:
-                warnings.extend([f"Type non reconnu: '{w}'" for w in warns])
+            warnings.extend([f"Type non reconnu: '{w}'" for w in warns])
 
-        # Secteurs
         if sectors:
             resolved, warns = resolve_mapping(sectors, SECTOR_MAPPING)
             if resolved:
                 filters["sector"] = resolved
-            if warns:
-                warnings.extend([f"Secteur non reconnu: '{w}'" for w in warns])
+            warnings.extend([f"Secteur non reconnu: '{w}'" for w in warns])
 
-        # Dates
         if date_from:
             filters["depuis"] = date_from
         if date_to:
             filters["jusquau"] = date_to
-
-        # Montants
         if amount_min is not None:
             filters["Montantmin"] = amount_min
         if amount_max is not None:
             filters["Montantmax"] = amount_max
 
-        # Tri
         apply_sort(filters, sort_by, sort_order)
 
-        # Requête
         result = await api_client.get_operations(page=page, filters=filters)
-        response = format_response(result, max_results)
+        return _add_warnings(format_response(result, max_results), warnings)
 
-        # Ajouter les warnings si nécessaire
-        if warnings:
-            parsed = json.loads(response)
-            parsed["warnings"] = warnings
-            response = json.dumps(parsed, ensure_ascii=False, indent=2)
-
-        return response
-
-    except CFNewsAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
-    except Exception as e:
-        return json.dumps({"error": f"Erreur inattendue: {str(e)}"}, ensure_ascii=False)
+    except (CFNewsAPIError, Exception) as e:
+        return _error(e)
 
 
 @mcp.tool()
@@ -359,38 +354,32 @@ async def search_funds(
     📌 CAS D'USAGE :
     - Trouver un fonds par nom → fund_name="Eurazeo PME III"
     - Fonds gérés par une société de gestion → management_company="Ardian"
-    - Dernières levées de fonds LBO → segments=["LBO"], status=["Closé"]
+    - Dernières levées LBO closées → segments=["LBO"], status=["Closé"]
 
     Args:
         fund_name: Nom du véhicule
         management_company: Société de gestion
-        fund_types: Types de véhicules (ex: ["FCPR", "FPCI", "SLP", "SICAV"])
-        segments: Segments. Valeurs acceptées :
-            "LBO", "Capital développement", "Capital innovation / VC", "Amorçage",
-            "Dette", "Fonds de fonds", "Infrastructure", "Immobilier", "Secondaire",
-            "Retournement", "Mezzanine"
-        status: Statuts. Valeurs acceptées :
-            "Closé", "En cours de levée", "1er closing", "En préparation"
+        fund_types: Types (ex: ["FCPR", "FPCI", "SLP", "SICAV"])
+        segments: Segments. Valeurs : "LBO", "Capital développement",
+            "Capital innovation / VC", "Amorçage", "Dette", "Fonds de fonds",
+            "Infrastructure", "Immobilier", "Secondaire", "Retournement", "Mezzanine"
+        status: Statuts. Valeurs : "Closé", "En cours de levée", "1er closing", "En préparation"
         amount_raised_min: Montant levé minimum en M€
         amount_raised_max: Montant levé maximum en M€
         sort_by: Champ de tri (optionnel)
         sort_order: "descending" (défaut) ou "ascending"
         page: Numéro de page
         max_results: Nombre maximum de résultats
-
-    Returns:
-        JSON formaté des fonds trouvés
     """
     try:
         api_client = get_client()
-        filters = {}
-        warnings = []
+        filters: Dict[str, Any] = {}
+        warnings: List[str] = []
 
         if fund_name:
             filters["vehicle_nom"] = fund_name
         if management_company:
             filters["vehicle_soc_nom"] = management_company
-
         if fund_types:
             filters["vehicle_type"] = fund_types
 
@@ -398,15 +387,13 @@ async def search_funds(
             resolved, warns = resolve_mapping(segments, FUND_SEGMENT_MAPPING)
             if resolved:
                 filters["vehicle_segment"] = resolved
-            if warns:
-                warnings.extend([f"Segment non reconnu: '{w}'" for w in warns])
+            warnings.extend([f"Segment non reconnu: '{w}'" for w in warns])
 
         if status:
             resolved, warns = resolve_mapping(status, FUND_STATUS_MAPPING)
             if resolved:
                 filters["vehicle_status"] = resolved
-            if warns:
-                warnings.extend([f"Statut non reconnu: '{w}'" for w in warns])
+            warnings.extend([f"Statut non reconnu: '{w}'" for w in warns])
 
         if amount_raised_min is not None:
             filters["Montantmin"] = amount_raised_min
@@ -416,19 +403,10 @@ async def search_funds(
         apply_sort(filters, sort_by, sort_order)
 
         result = await api_client.get_vehicules(page=page, filters=filters)
-        response = format_response(result, max_results)
+        return _add_warnings(format_response(result, max_results), warnings)
 
-        if warnings:
-            parsed = json.loads(response)
-            parsed["warnings"] = warnings
-            response = json.dumps(parsed, ensure_ascii=False, indent=2)
-
-        return response
-
-    except CFNewsAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
-    except Exception as e:
-        return json.dumps({"error": f"Erreur inattendue: {str(e)}"}, ensure_ascii=False)
+    except (CFNewsAPIError, Exception) as e:
+        return _error(e)
 
 
 @mcp.tool()
@@ -449,35 +427,30 @@ async def search_actors(
     📌 CAS D'USAGE :
     - Trouver un fonds par nom → actor_name="Meridiam"
     - Lister les avocats M&A → actor_types=["Avocats"]
-    - Fonds tech en Île-de-France → is_tech_fund=True, regions=["Île-de-France"]
+    - Fonds tech en IdF → is_tech_fund=True, regions=["Île-de-France"]
 
     💡 Pour récupérer l'ID d'un fonds (nécessaire pour get_fund_portfolio), cherchez-le ici.
 
     Args:
         actor_name: Nom de l'acteur
-        actor_types: Types d'acteurs. Valeurs acceptées :
-            "Fonds d'investissement", "Avocats", "Banquiers", "Conseils",
-            "Investisseurs institutionnels", "Asset Managers", "Family Offices",
-            "Auditeurs / Due Diligence"
-        nationalities: Nationalités (codes ISO: "FR", "US", "GB", "DE", etc.)
-        regions: Régions françaises. Valeurs acceptées :
-            "Île-de-France", "Auvergne-Rhône-Alpes", "Bourgogne-Franche-Comté",
-            "Bretagne", "Centre-Val de Loire", "Corse", "Grand Est",
-            "Hauts-de-France", "Normandie", "Nouvelle-Aquitaine", "Occitanie",
-            "Pays de la Loire", "Provence-Alpes-Côte d'Azur"
-        is_tech_fund: Filtre pour les fonds TECH uniquement
+        actor_types: Types. Valeurs : "Fonds d'investissement", "Avocats", "Banquiers",
+            "Conseils", "Investisseurs institutionnels", "Asset Managers",
+            "Family Offices", "Auditeurs / Due Diligence"
+        nationalities: Codes ISO ("FR", "US", "GB", "DE", etc.)
+        regions: Régions françaises. Valeurs : "Île-de-France", "Auvergne-Rhône-Alpes",
+            "Bourgogne-Franche-Comté", "Bretagne", "Centre-Val de Loire", "Corse",
+            "Grand Est", "Hauts-de-France", "Normandie", "Nouvelle-Aquitaine",
+            "Occitanie", "Pays de la Loire", "Provence-Alpes-Côte d'Azur"
+        is_tech_fund: Filtre fonds TECH uniquement
         sort_by: Champ de tri (optionnel)
         sort_order: "descending" (défaut) ou "ascending"
         page: Numéro de page
         max_results: Nombre maximum de résultats
-
-    Returns:
-        JSON formaté des acteurs trouvés
     """
     try:
         api_client = get_client()
-        filters = {}
-        warnings = []
+        filters: Dict[str, Any] = {}
+        warnings: List[str] = []
 
         if actor_name:
             filters["acteur_nom"] = actor_name
@@ -486,8 +459,7 @@ async def search_actors(
             resolved, warns = resolve_mapping(actor_types, ACTOR_TYPE_MAPPING)
             if resolved:
                 filters["acteur_domaine"] = resolved
-            if warns:
-                warnings.extend([f"Type d'acteur non reconnu: '{w}'" for w in warns])
+            warnings.extend([f"Type d'acteur non reconnu: '{w}'" for w in warns])
 
         if nationalities:
             filters["acteur_zone"] = nationalities
@@ -496,8 +468,7 @@ async def search_actors(
             resolved, warns = resolve_mapping(regions, REGION_MAPPING)
             if resolved:
                 filters["acteur_region"] = resolved
-            if warns:
-                warnings.extend([f"Région non reconnue: '{w}'" for w in warns])
+            warnings.extend([f"Région non reconnue: '{w}'" for w in warns])
 
         if is_tech_fund is not None:
             filters["uniqut_istech"] = "oui" if is_tech_fund else "non"
@@ -505,19 +476,10 @@ async def search_actors(
         apply_sort(filters, sort_by, sort_order)
 
         result = await api_client.get_acteurs(page=page, filters=filters)
-        response = format_response(result, max_results)
+        return _add_warnings(format_response(result, max_results), warnings)
 
-        if warnings:
-            parsed = json.loads(response)
-            parsed["warnings"] = warnings
-            response = json.dumps(parsed, ensure_ascii=False, indent=2)
-
-        return response
-
-    except CFNewsAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
-    except Exception as e:
-        return json.dumps({"error": f"Erreur inattendue: {str(e)}"}, ensure_ascii=False)
+    except (CFNewsAPIError, Exception) as e:
+        return _error(e)
 
 
 @mcp.tool()
@@ -539,13 +501,12 @@ async def search_companies(
 
     📌 CAS D'USAGE :
     - Trouver une société → company_name="Doctolib"
-    - Sociétés sous LBO dans la santé → company_types=["Sté sous LBO"], sectors=["Santé, beauté et services associés"]
-    - PME tech en régions → is_tech=True, revenue_max=50
+    - Sociétés sous LBO santé → company_types=["Sté sous LBO"], sectors=["Santé, beauté et services associés"]
+    - PME tech → is_tech=True, revenue_max=50
 
     Args:
         company_name: Nom de la société
-        company_types: Types. Valeurs acceptées :
-            "Familiale", "Sté sous LBO", "Cotée", "Indépendante"
+        company_types: Types. Valeurs : "Familiale", "Sté sous LBO", "Cotée", "Indépendante"
         sectors: Secteurs d'activité (mêmes valeurs que search_operations)
         regions: Régions françaises (mêmes valeurs que search_actors)
         revenue_min: CA minimum en M€
@@ -555,21 +516,11 @@ async def search_companies(
         sort_order: "descending" (défaut) ou "ascending"
         page: Numéro de page
         max_results: Nombre maximum de résultats
-
-    Returns:
-        JSON formaté des sociétés trouvées
     """
     try:
         api_client = get_client()
-        filters = {}
-        warnings = []
-
-        COMPANY_TYPE_MAPPING = {
-            "Familiale": 260,
-            "Sté sous LBO": 20104,
-            "Cotée": 18904,
-            "Indépendante": 259,
-        }
+        filters: Dict[str, Any] = {}
+        warnings: List[str] = []
 
         if company_name:
             filters["soc_nom"] = company_name
@@ -578,47 +529,34 @@ async def search_companies(
             resolved, warns = resolve_mapping(company_types, COMPANY_TYPE_MAPPING)
             if resolved:
                 filters["soc_activity"] = resolved
-            if warns:
-                warnings.extend([f"Type de société non reconnu: '{w}'" for w in warns])
+            warnings.extend([f"Type de société non reconnu: '{w}'" for w in warns])
 
         if sectors:
             resolved, warns = resolve_mapping(sectors, SECTOR_MAPPING)
             if resolved:
                 filters["sector"] = resolved
-            if warns:
-                warnings.extend([f"Secteur non reconnu: '{w}'" for w in warns])
+            warnings.extend([f"Secteur non reconnu: '{w}'" for w in warns])
 
         if regions:
             resolved, warns = resolve_mapping(regions, REGION_MAPPING)
             if resolved:
                 filters["soc_region"] = resolved
-            if warns:
-                warnings.extend([f"Région non reconnue: '{w}'" for w in warns])
+            warnings.extend([f"Région non reconnue: '{w}'" for w in warns])
 
         if revenue_min is not None:
             filters["soc_camin"] = revenue_min
         if revenue_max is not None:
             filters["soc_camax"] = revenue_max
-
         if is_tech is not None:
             filters["uniqut_istech"] = "oui" if is_tech else "non"
 
         apply_sort(filters, sort_by, sort_order)
 
         result = await api_client.get_societes(page=page, filters=filters)
-        response = format_response(result, max_results)
+        return _add_warnings(format_response(result, max_results), warnings)
 
-        if warnings:
-            parsed = json.loads(response)
-            parsed["warnings"] = warnings
-            response = json.dumps(parsed, ensure_ascii=False, indent=2)
-
-        return response
-
-    except CFNewsAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
-    except Exception as e:
-        return json.dumps({"error": f"Erreur inattendue: {str(e)}"}, ensure_ascii=False)
+    except (CFNewsAPIError, Exception) as e:
+        return _error(e)
 
 
 @mcp.tool()
@@ -646,27 +584,23 @@ async def search_people(
     Args:
         name: Nom ou prénom de la personne
         organization: Organisation actuelle
-        titles: Titres/fonctions. Valeurs acceptées :
-            "Président", "Directeur général", "Directeur", "Associé(e)",
-            "Partner", "Managing Director", "Vice-Président", "Analyste",
-            "Chargé d'affaires"
-        organization_types: Types d'organisation. Valeurs acceptées :
-            "Fonds", "Avocats", "Banquiers", "Conseils", "Sociétés"
-        regions: Régions de l'organisation (mêmes valeurs que search_actors)
-        executives_only: Filtre cadres dirigeants / CODIR uniquement
-        with_email: Filtre uniquement les personnes avec email renseigné
+        titles: Titres. Valeurs : "Président", "Directeur général", "Directeur",
+            "Associé(e)", "Partner", "Managing Director", "Vice-Président",
+            "Analyste", "Chargé d'affaires"
+        organization_types: Types d'org. Valeurs : "Fonds", "Avocats", "Banquiers",
+            "Conseils", "Sociétés"
+        regions: Régions (mêmes valeurs que search_actors)
+        executives_only: Filtre dirigeants / CODIR uniquement
+        with_email: Filtre personnes avec email renseigné
         sort_by: Champ de tri (optionnel)
         sort_order: "descending" (défaut) ou "ascending"
         page: Numéro de page
         max_results: Nombre maximum de résultats
-
-    Returns:
-        JSON formaté des personnalités trouvées
     """
     try:
         api_client = get_client()
-        filters = {}
-        warnings = []
+        filters: Dict[str, Any] = {}
+        warnings: List[str] = []
 
         if name:
             filters["people_nom"] = name
@@ -677,22 +611,19 @@ async def search_people(
             resolved, warns = resolve_mapping(titles, PEOPLE_TITLE_MAPPING)
             if resolved:
                 filters["people_titres"] = resolved
-            if warns:
-                warnings.extend([f"Titre non reconnu: '{w}'" for w in warns])
+            warnings.extend([f"Titre non reconnu: '{w}'" for w in warns])
 
         if organization_types:
             resolved, warns = resolve_mapping(organization_types, PEOPLE_ORG_TYPE_MAPPING)
             if resolved:
                 filters["people_type_organisation"] = resolved
-            if warns:
-                warnings.extend([f"Type d'organisation non reconnu: '{w}'" for w in warns])
+            warnings.extend([f"Type d'org non reconnu: '{w}'" for w in warns])
 
         if regions:
             resolved, warns = resolve_mapping(regions, REGION_MAPPING)
             if resolved:
                 filters["people_region"] = resolved
-            if warns:
-                warnings.extend([f"Région non reconnue: '{w}'" for w in warns])
+            warnings.extend([f"Région non reconnue: '{w}'" for w in warns])
 
         if executives_only:
             filters["ciblage_dirigeants"] = "Dirigeants"
@@ -702,19 +633,10 @@ async def search_people(
         apply_sort(filters, sort_by, sort_order)
 
         result = await api_client.get_people(page=page, filters=filters)
-        response = format_response(result, max_results)
+        return _add_warnings(format_response(result, max_results), warnings)
 
-        if warnings:
-            parsed = json.loads(response)
-            parsed["warnings"] = warnings
-            response = json.dumps(parsed, ensure_ascii=False, indent=2)
-
-        return response
-
-    except CFNewsAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
-    except Exception as e:
-        return json.dumps({"error": f"Erreur inattendue: {str(e)}"}, ensure_ascii=False)
+    except (CFNewsAPIError, Exception) as e:
+        return _error(e)
 
 
 @mcp.tool()
@@ -733,7 +655,7 @@ async def search_news(
     Recherche des actualités CFNEWS.
 
     📌 CAS D'USAGE :
-    - Dernières news LBO → themes=["LBO"], sort_order="descending"
+    - Dernières news LBO → themes=["LBO"]
     - Articles sur une boîte → title="Doctolib"
     - News fintech récentes → keywords=["fintech"], date_from="2024-01-01"
 
@@ -741,19 +663,16 @@ async def search_news(
         title: Mots dans le titre
         themes: Thèmes (ex: ["LBO", "Levée de Fonds", "M&A", "Nomination"])
         keywords: Mots-clés (ex: ["capital investissement", "fintech"])
-        date_from: Date de début de publication (YYYY-MM-DD)
-        date_to: Date de fin de publication (YYYY-MM-DD)
+        date_from: Date de début (YYYY-MM-DD)
+        date_to: Date de fin (YYYY-MM-DD)
         sort_by: Champ de tri (optionnel)
         sort_order: "descending" (défaut) ou "ascending"
         page: Numéro de page
         max_results: Nombre maximum de résultats
-
-    Returns:
-        JSON formaté des actualités trouvées
     """
     try:
         api_client = get_client()
-        filters = {}
+        filters: Dict[str, Any] = {}
 
         if title:
             filters["title"] = title
@@ -771,15 +690,14 @@ async def search_news(
         result = await api_client.get_actualites(page=page, filters=filters)
         return format_response(result, max_results)
 
-    except CFNewsAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
-    except Exception as e:
-        return json.dumps({"error": f"Erreur inattendue: {str(e)}"}, ensure_ascii=False)
+    except (CFNewsAPIError, Exception) as e:
+        return _error(e)
 
 
 # ═══════════════════════════════════════════════════════════════
-# TOOLS — PORTEFEUILLE & DÉTAILS
+# TOOLS — PORTEFEUILLE
 # ═══════════════════════════════════════════════════════════════
+
 
 @mcp.tool()
 async def get_fund_portfolio(
@@ -789,22 +707,17 @@ async def get_fund_portfolio(
     """
     Récupère le portefeuille d'un fonds d'investissement.
 
-    ⚠️ LIMITATION : Cette méthode ne supporte PAS la pagination.
-    Pour les fonds avec un grand portefeuille (>30 sociétés), elle peut échouer
-    avec une erreur de dépassement de taille.
-    → Dans ce cas, utiliser search_operations(investor_name="NomDuFonds") à la place.
+    ⚠️ LIMITATION : Pas de pagination. Pour les gros fonds (>30 participations),
+    cette méthode peut échouer → utiliser search_operations(investor_name=...) à la place.
 
     📌 CAS D'USAGE :
     - Portefeuille actuel d'un petit/moyen fonds → portfolio_type="current"
     - Sorties d'un fonds → portfolio_type="exits"
-    - Grand fonds (Meridiam, Ardian, etc.) → PRÉFÉRER search_operations avec investor_name
+    - Grand fonds (Meridiam, Ardian…) → PRÉFÉRER search_operations avec investor_name
 
     Args:
         fund_id: ID du fonds (récupéré via search_actors)
         portfolio_type: "current" (portefeuille actuel) ou "exits" (sorties)
-
-    Returns:
-        JSON formaté du portefeuille
     """
     try:
         api_client = get_client()
@@ -824,14 +737,12 @@ async def get_fund_portfolio(
             return json.dumps(result, ensure_ascii=False, indent=2)
 
         except CFNewsAPIError as e:
-            # Fallback : si le portefeuille est trop grand, guider vers search_operations
-            error_str = str(e)
-            if "taille" in error_str.lower() or "size" in error_str.lower() or "limit" in error_str.lower():
+            error_str = str(e).lower()
+            if any(kw in error_str for kw in ("taille", "size", "limit", "too large")):
                 return json.dumps(
                     {
-                        "error": f"Portefeuille trop volumineux pour cet endpoint: {error_str}",
+                        "error": f"Portefeuille trop volumineux: {str(e)}",
                         "suggestion": (
-                            "Le portefeuille de ce fonds est trop grand. "
                             "Utilisez search_operations(investor_name='NOM_DU_FONDS', "
                             "sort_by='date', sort_order='descending') pour obtenir "
                             "les deals de manière paginée."
@@ -842,36 +753,32 @@ async def get_fund_portfolio(
                 )
             raise
 
-    except CFNewsAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
-    except Exception as e:
-        return json.dumps({"error": f"Erreur inattendue: {str(e)}"}, ensure_ascii=False)
+    except (CFNewsAPIError, Exception) as e:
+        return _error(e)
+
+
+# ═══════════════════════════════════════════════════════════════
+# TOOLS — FICHES DÉTAILLÉES
+# ═══════════════════════════════════════════════════════════════
 
 
 @mcp.tool()
 async def get_operation_detail(operation_id: int) -> str:
     """
-    Récupère le détail complet d'une opération spécifique.
+    Récupère le détail complet d'une opération.
 
-    📌 CAS D'USAGE :
-    - Après une recherche via search_operations, obtenir tous les détails d'un deal :
-      valorisation, multiples, conseils impliqués, description complète, etc.
+    📌 Après une recherche via search_operations, obtenir tous les détails d'un deal :
+    valorisation, multiples, conseils impliqués, description complète, etc.
 
     Args:
         operation_id: ID de l'opération (récupéré via search_operations)
-
-    Returns:
-        JSON formaté avec tous les détails de l'opération
     """
     try:
         api_client = get_client()
         result = await api_client.get_operation_detail(operation_id)
         return json.dumps(result, ensure_ascii=False, indent=2)
-
-    except CFNewsAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
-    except Exception as e:
-        return json.dumps({"error": f"Erreur inattendue: {str(e)}"}, ensure_ascii=False)
+    except (CFNewsAPIError, Exception) as e:
+        return _error(e)
 
 
 @mcp.tool()
@@ -879,25 +786,18 @@ async def get_actor_detail(actor_id: int) -> str:
     """
     Récupère la fiche complète d'un acteur.
 
-    📌 CAS D'USAGE :
-    - Après une recherche via search_actors, obtenir la fiche détaillée :
-      équipe, AUM, historique, bureaux, spécialités, etc.
+    📌 Après search_actors, obtenir la fiche détaillée :
+    équipe, AUM, historique, bureaux, spécialités, etc.
 
     Args:
         actor_id: ID de l'acteur (récupéré via search_actors)
-
-    Returns:
-        JSON formaté avec tous les détails de l'acteur
     """
     try:
         api_client = get_client()
         result = await api_client.get_actor_detail(actor_id)
         return json.dumps(result, ensure_ascii=False, indent=2)
-
-    except CFNewsAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
-    except Exception as e:
-        return json.dumps({"error": f"Erreur inattendue: {str(e)}"}, ensure_ascii=False)
+    except (CFNewsAPIError, Exception) as e:
+        return _error(e)
 
 
 @mcp.tool()
@@ -905,53 +805,73 @@ async def get_company_detail(company_id: int) -> str:
     """
     Récupère la fiche complète d'une société.
 
-    📌 CAS D'USAGE :
-    - Après une recherche via search_companies, obtenir la fiche détaillée :
-      CA, effectifs, actionnariat, historique des opérations, etc.
+    📌 Après search_companies, obtenir la fiche détaillée :
+    CA, effectifs, actionnariat, historique des opérations, etc.
 
     Args:
         company_id: ID de la société (récupéré via search_companies)
-
-    Returns:
-        JSON formaté avec tous les détails de la société
     """
     try:
         api_client = get_client()
         result = await api_client.get_company_detail(company_id)
         return json.dumps(result, ensure_ascii=False, indent=2)
+    except (CFNewsAPIError, Exception) as e:
+        return _error(e)
 
-    except CFNewsAPIError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
-    except Exception as e:
-        return json.dumps({"error": f"Erreur inattendue: {str(e)}"}, ensure_ascii=False)
+
+@mcp.tool()
+async def get_people_detail(people_id: int) -> str:
+    """
+    Récupère la fiche complète d'une personnalité.
+
+    📌 Après search_people, obtenir le profil détaillé :
+    parcours, coordonnées, historique de postes, etc.
+
+    Args:
+        people_id: ID de la personne (récupéré via search_people)
+    """
+    try:
+        api_client = get_client()
+        result = await api_client.get_people_detail(people_id)
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except (CFNewsAPIError, Exception) as e:
+        return _error(e)
+
+
+@mcp.tool()
+async def get_fund_detail(vehicule_id: int) -> str:
+    """
+    Récupère la fiche complète d'un véhicule d'investissement.
+
+    📌 Après search_funds, obtenir les détails :
+    taille cible, montant levé, investisseurs, vintage, etc.
+
+    Args:
+        vehicule_id: ID du véhicule (récupéré via search_funds)
+    """
+    try:
+        api_client = get_client()
+        result = await api_client.get_vehicule_detail(vehicule_id)
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except (CFNewsAPIError, Exception) as e:
+        return _error(e)
 
 
 # ═══════════════════════════════════════════════════════════════
 # TOOLS — RÉFÉRENTIEL
 # ═══════════════════════════════════════════════════════════════
 
+
 @mcp.tool()
-async def get_reference_data(
-    category: str,
-) -> str:
+async def get_reference_data(category: str) -> str:
     """
     Retourne les valeurs de référence acceptées pour les filtres de recherche.
 
-    Utile pour connaître les valeurs exactes à passer aux autres tools.
-
     Args:
-        category: Catégorie de référence. Valeurs acceptées :
-            "operation_types" — Types d'opérations (LBO, M&A, etc.)
-            "sectors" — Secteurs d'activité
-            "actor_types" — Types d'acteurs (Fonds, Avocats, etc.)
-            "regions" — Régions françaises
-            "fund_segments" — Segments de fonds
-            "fund_status" — Statuts de fonds
-            "people_titles" — Titres/fonctions
-            "people_org_types" — Types d'organisations (bottin)
-
-    Returns:
-        JSON avec les paires nom → ID pour la catégorie demandée
+        category: Catégorie. Valeurs acceptées :
+            "operation_types", "sectors", "actor_types", "regions",
+            "fund_segments", "fund_status", "people_titles",
+            "people_org_types", "company_types"
     """
     REFERENCE_MAP = {
         "operation_types": OPERATION_TYPE_MAPPING,
@@ -962,6 +882,7 @@ async def get_reference_data(
         "fund_status": FUND_STATUS_MAPPING,
         "people_titles": PEOPLE_TITLE_MAPPING,
         "people_org_types": PEOPLE_ORG_TYPE_MAPPING,
+        "company_types": COMPANY_TYPE_MAPPING,
     }
 
     if category not in REFERENCE_MAP:
